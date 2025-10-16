@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Generic resume-safe translator:
-- Translates DEFAULT_COL -> TARGET_COL ONLY when EXAMPLE_COL is non-empty
-  and TARGET_COL is empty.
+- Translates input_lang_col -> target_lang_col ONLY when indicator_col is True
+  and target_lang_col is empty.
 - Preserves HTML or json formatting.
 - Writes progress after each batch, so it can resume if interrupted.
 
-Configurable via constants below or env vars.
 """
 
 import os
@@ -25,13 +24,6 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "40"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 BASE_SLEEP = float(os.getenv("BASE_SLEEP", "2.0"))
 SEP = "\n\n---\n\n"  # separator between items
-
-DEFAULT_COL = os.getenv("DEFAULT_COL", "Default content")
-EXAMPLE_COL = os.getenv("EXAMPLE_COL", "Translated content")
-TARGET_COL = os.getenv("TARGET_COL", "New content")
-
-DEFAULT_LANG = os.getenv("DEFAULT_LANG", "English")
-TARGET_LANG = os.getenv("TARGET_LANG", "French")
 # --------------------------------------------------------------
 
 
@@ -41,12 +33,12 @@ def die(msg: str, code: int = 1):
 
 
 def read_csv(path: str) -> pd.DataFrame:
-    return pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+    return pd.read_csv(path, encoding="utf-8-sig")
 
 
 def write_csv_atomic(df: pd.DataFrame, out_path: str):
     temp_path = out_path + ".tmp"
-    df.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    df.to_csv(temp_path, index=False, encoding="utf-8-sig", sep="|")
     os.replace(temp_path, out_path)
 
 
@@ -56,25 +48,27 @@ def must_have_columns(df: pd.DataFrame, cols: List[str]):
         die(f"Missing required columns: {missing}")
 
 
-def build_prompt(texts: List[str]) -> str:
+def build_prompt(texts: List[str], input_lang: str, target_lang: str) -> str:
     header = (
         f"You are a professional translator specialized in sports eyewear and outdoor gear. "
-        f"Translate the following {DEFAULT_LANG} snippets into natural, compelling {TARGET_LANG}. "
+        f"Translate the following {input_lang} snippets into natural, compelling {target_lang}. "
         "Preserve ALL JSON structure exactly (do not add, remove, or reorder structure). "
         "Preserve HTML tags and attributes exactly when pertaining to formatting such as tables, lists, ... "
         "When encountering HTML entities used for emphasizing text, you may reuse them when appropriate in the translated version. "
         "Do not include explanations. Output ONLY the translations, joined by the exact separator below.\n\n"
-        "Do not translate anything related to the HTML or JSON structure itself, such as tag names, attribute names, or JSON keys. "
+        "Do not translate anything related to URLs, the HTML or JSON structure itself, such as tag names, attribute names, or JSON keys. "
         f"Separator to use between items (exactly): {SEP!r}\n\n"
         "Input items start below:\n"
     )
     return header + SEP.join(texts)
 
 
-def translate_batch(client: OpenAI, texts: List[str]) -> List[str]:
+def translate_batch(
+    client: OpenAI, texts: List[str], input_lang: str, target_lang: str
+) -> List[str]:
     if not texts:
         return []
-    prompt = build_prompt(texts)
+    prompt = build_prompt(texts, input_lang, target_lang)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -100,24 +94,41 @@ def translate_batch(client: OpenAI, texts: List[str]) -> List[str]:
             time.sleep(sleep_s)
 
 
-def ensure_target_last(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_target_last(df: pd.DataFrame, target_lang_col: str) -> pd.DataFrame:
     cols = list(df.columns)
-    if cols[-1] != TARGET_COL:
-        cols = [c for c in cols if c != TARGET_COL] + [TARGET_COL]
+    if cols[-1] != target_lang_col:
+        cols = [c for c in cols if c != target_lang_col] + [target_lang_col]
         df = df[cols]
     return df
 
 
-def main():
+def translate(
+    input_lang_col: str,
+    target_lang_col: str,
+    indicator_col: str,
+    target_lang: str,
+    input_lang: str = "English",
+) -> None:
+    """Translate input_lang_col to target_lang_col when indicator_col is True and target_lang_col
+    is empty.
+    Args:
+        input_lang_col (str): Column name of the column with text to translate.
+        target_lang_col (str): Column name of the column to write translations to.
+        indicator_col (str): Column name of the Boolean column indicating whether translation is needed.
+        target_lang (str): Target language for translation.
+        input_lang (str, optional): Source language. Defaults to "English".
+    Returns:
+        None: Modifies DataFrame in place.
+    """
     if len(sys.argv) != 3:
-        die("Usage: python translate_generic.py /path/in.csv /path/out.csv")
+        die("Usage: python translator.py /path/in.csv /path/out.csv")
 
     in_path, out_path = sys.argv[1], sys.argv[2]
     if not os.path.exists(in_path):
         die(f"Input file not found: {in_path}")
 
     src = read_csv(in_path)
-    must_have_columns(src, [DEFAULT_COL, EXAMPLE_COL])
+    must_have_columns(src, [input_lang_col, indicator_col])
 
     if os.path.exists(out_path):
         print(f"[info] Resuming from existing output: {out_path}")
@@ -130,20 +141,22 @@ def main():
     else:
         out = src.copy()
 
-    if TARGET_COL not in out.columns:
-        out[TARGET_COL] = ""
-    out[TARGET_COL] = out[TARGET_COL].astype(str).fillna("")
+    if target_lang_col not in out.columns:
+        out[target_lang_col] = ""
+    out[target_lang_col] = out[target_lang_col].astype(str).fillna("")
 
-    example = out[EXAMPLE_COL].fillna("").astype(str).str.strip()
-    target = out[TARGET_COL].fillna("").astype(str).str.strip()
-    todo_mask = (example != "") & (target == "")
+    indicator = out[indicator_col].fillna(False).astype(bool)
+    target = (
+        out[target_lang_col].astype(str).str.strip().replace({"nan": pd.NA, "": pd.NA})
+    )  # treat "nan" strings as empty
+    todo_mask = (indicator) & (target.isna())
     idx_to_translate = out.index[todo_mask].tolist()
 
     print(f"[info] Total rows: {len(out)}")
     print(f"[info] Rows requiring translation: {len(idx_to_translate)}")
 
     if not idx_to_translate:
-        out = ensure_target_last(out)
+        out = ensure_target_last(out, target_lang_col)
         write_csv_atomic(out, out_path)
         print(f"[done] Nothing to do. Wrote: {out_path}")
         return
@@ -157,24 +170,18 @@ def main():
     for start in range(0, total, BATCH_SIZE):
         end = min(start + BATCH_SIZE, total)
         batch_idx = idx_to_translate[start:end]
-        texts = out.loc[batch_idx, DEFAULT_COL].fillna("").astype(str).tolist()
+        texts = out.loc[batch_idx, input_lang_col].astype(str)
 
-        nonempty_pairs = [(i, t) for i, t in enumerate(texts) if t.strip() != ""]
-        order_indices = [i for (i, _) in nonempty_pairs]
-        nonempty_texts = [t for (_, t) in nonempty_pairs]
+        nonempty_mask = texts.str.strip().ne("")
+        to_call_idx = texts.index[nonempty_mask]
+        to_call_texts = texts.loc[to_call_idx].tolist()
 
-        translations = []
-        if nonempty_texts:
-            translations = translate_batch(client, nonempty_texts)
+        if len(to_call_texts):
+            translations = translate_batch(client, to_call_texts, input_lang, target_lang)
+            # Assign back in the exact same order
+            out.loc[to_call_idx, target_lang_col] = translations
 
-        full_results = [""] * len(texts)
-        for pos, trans in zip(order_indices, translations):
-            full_results[pos] = trans
-
-        for row_i, tgt_text in zip(batch_idx, full_results):
-            out.at[row_i, TARGET_COL] = tgt_text
-
-        out = ensure_target_last(out)
+        out = ensure_target_last(out, target_lang_col)
         write_csv_atomic(out, out_path)
 
         print(f"[info] Saved progress {start + 1}-{end} / {total}")
@@ -183,4 +190,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    translate(
+        input_lang_col="text_en",
+        target_lang_col="target",
+        indicator_col="translate",
+        target_lang="Spanish",
+        input_lang="English",
+    )
